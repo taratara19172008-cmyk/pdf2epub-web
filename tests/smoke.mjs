@@ -47,6 +47,35 @@ function makePdf() {
   return new Uint8Array(Buffer.from(pdf));
 }
 
+function makeImagePdf(pageCount, image) {
+  const imageHex = Buffer.from(image).toString('hex').toUpperCase();
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    `<< /Type /Pages /Kids [${Array.from({ length: pageCount }, (_, i) => `${3 + i} 0 R`).join(' ')}] /Count ${pageCount} >>`
+  ];
+  for (let i = 0; i < pageCount; i++) {
+    const contentObject = 3 + pageCount + i;
+    objects.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 400] /Resources << /XObject << /Im0 ${3 + pageCount * 2} 0 R >> >> /Contents ${contentObject} 0 R >>`);
+  }
+  for (let i = 0; i < pageCount; i++) {
+    const content = 'q 300 0 0 400 0 0 cm /Im0 Do Q';
+    objects.push(`<< /Length ${content.length} >>\nstream\n${content}\nendstream`);
+  }
+  objects.push(`<< /Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter [/ASCIIHexDecode /DCTDecode] /Length ${imageHex.length + 1} >>\nstream\n${imageHex}>\nendstream`);
+
+  let pdf = '%PDF-1.4\n';
+  const offsets = [0];
+  for (let index = 0; index < objects.length; index++) {
+    offsets.push(Buffer.byteLength(pdf));
+    pdf += `${index + 1} 0 obj\n${objects[index]}\nendobj\n`;
+  }
+  const xrefOffset = Buffer.byteLength(pdf);
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (let index = 1; index < offsets.length; index++) pdf += `${String(offsets[index]).padStart(10, '0')} 00000 n \n`;
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`;
+  return new Uint8Array(Buffer.from(pdf));
+}
+
 function readFirstZipEntry(buffer) {
   assert.equal(buffer.readUInt32LE(0), 0x04034b50, 'ZIP local file header signature');
   const method = buffer.readUInt16LE(8);
@@ -141,4 +170,50 @@ const bookmarkNav = await textArchive.file('OEBPS/nav.xhtml').async('string');
 assert.match(bookmarkNav, /第一章/);
 assert.match(bookmarkNav, /page-0002\.xhtml#page-2/);
 
-console.log(`EPUB smoke test passed; generated ${textPath} (${textBytes.length} B) and ${layoutPath} (${layoutBytes.length} B).`);
+// A real three-page image-only PDF exercises PDF parsing, page discovery, EPUB image
+// writing, and the XHTML/OPF resource references without requiring a browser canvas.
+const jpeg = Buffer.from('/9j/4AAQSkZJRgABAgAAAQABAAD//gAQTGF2YzYxLjE5LjEwMQD/2wBDAAgEBAQEBAUFBQUFBQYGBgYGBgYGBgYGBgYHBwcICAgHBwcGBgcHCAgICAkJCQgICAgJCQoKCgwMCwsODg4RERT/xABLAAEBAAAAAAAAAAAAAAAAAAAABwEBAAAAAAAAAAAAAAAAAAAAABABAAAAAAAAAAAAAAAAAAAAABEBAAAAAAAAAAAAAAAAAAAAAP/AABEIAAIAAgMBIgACEQADEQD/2gAMAwEAAhEDEQA/AL+AD//Z', 'base64');
+const imagePdfTask = pdfjsLib.getDocument({ data: makeImagePdf(3, jpeg), isEvalSupported: false, verbosity: pdfjsLib.VerbosityLevel.ERRORS });
+let imagePages = 0;
+try {
+  const pdf = await imagePdfTask.promise;
+  assert.equal(pdf.numPages, 3);
+  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
+    const page = await pdf.getPage(pageNumber);
+    const text = await page.getTextContent();
+    assert.equal(text.items.length, 0, `page ${pageNumber} is image-only`);
+    const ops = await page.getOperatorList();
+    assert.ok(ops.fnArray.length > 0, `page ${pageNumber} has image paint operators`);
+    page.cleanup();
+    imagePages++;
+  }
+} finally {
+  await imagePdfTask.destroy();
+}
+assert.equal(imagePages, 3);
+const imageEpub = await Core.createEpub({
+  title: '扫描页测试', mode: 'layout', cover: jpeg, coverType: 'image/jpeg',
+  pages: Array.from({ length: imagePages }, () => ({ image: jpeg, imageType: 'image/jpeg', width: 300, height: 400 }))
+}, JSZip);
+const imageEpubPath = join(outputDir, 'test-image-only.epub');
+await writeFile(imageEpubPath, imageEpub);
+const imageArchive = await JSZip.loadAsync(await readFile(imageEpubPath));
+const imageOpf = await imageArchive.file('OEBPS/content.opf').async('string');
+const imageManifest = new Map([...imageOpf.matchAll(/<item id="([^"]+)" href="([^"]+)" media-type="([^"]+)"/g)].map(match => [match[2], match[3]]));
+for (let pageNumber = 1; pageNumber <= imagePages; pageNumber++) {
+  const padded = String(pageNumber).padStart(4, '0');
+  const xhtmlPath = `OEBPS/text/page-${padded}.xhtml`;
+  const xhtml = await imageArchive.file(xhtmlPath).async('string');
+  const src = xhtml.match(/<img[^>]+src="([^"]+)"/)?.[1];
+  assert.ok(src, `page ${pageNumber} XHTML references an image`);
+  const normalizedImagePath = `OEBPS/${src.replace(/^\.\.\//, '')}`;
+  const imageFile = imageArchive.file(normalizedImagePath);
+  assert.ok(imageFile, `page ${pageNumber} image exists at ${normalizedImagePath}`);
+  const imageBytes = await imageFile.async('nodebuffer');
+  assert.ok(imageBytes.length > 0, `page ${pageNumber} image is non-empty`);
+  assert.equal(imageBytes[0], 0xff, `page ${pageNumber} is JPEG`);
+  assert.equal(imageManifest.get(normalizedImagePath.slice('OEBPS/'.length)), 'image/jpeg', `page ${pageNumber} JPEG is declared in OPF`);
+}
+assert.match((await imageArchive.file('OEBPS/text/page-0002.xhtml').async('string')), /src="\.\.\/images\/page-0002\.jpg"/);
+
+console.log(`EPUB smoke test passed; generated ${textPath} (${textBytes.length} B), ${layoutPath} (${layoutBytes.length} B), and ${imageEpubPath}.`);

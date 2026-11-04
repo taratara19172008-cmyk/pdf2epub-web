@@ -23,6 +23,7 @@
     balanced: { maxEdge: 1200, quality: 0.68 },
     compact: { maxEdge: 950, quality: 0.58 }
   };
+  const maxCanvasPixels = 4_000_000;
   const downloadUrlRetentionMs = 10 * 60 * 1000;
 
   let selectedFile = null;
@@ -162,14 +163,28 @@
     });
   }
 
+  function boundedScale(viewport, maxEdge) {
+    const width = Math.max(1, viewport.width);
+    const height = Math.max(1, viewport.height);
+    const edgeScale = maxEdge / Math.max(width, height);
+    const areaScale = Math.sqrt(maxCanvasPixels / (width * height));
+    return Math.min(1.6, edgeScale, areaScale);
+  }
+
+  function canvasContext(canvas) {
+    const context = canvas.getContext('2d', { alpha: false });
+    if (!context) throw new Error('无法创建页面画布，请使用较新的 Safari 重试。');
+    return context;
+  }
+
   async function renderCover(page) {
     const viewport = page.getViewport({ scale: 1 });
-    const scale = Math.min(1.25, 850 / Math.max(viewport.width, viewport.height, 1));
+    const scale = Math.min(1.25, boundedScale(viewport, 850));
     const scaled = page.getViewport({ scale });
     const canvas = document.createElement('canvas');
     canvas.width = Math.max(1, Math.ceil(scaled.width));
     canvas.height = Math.max(1, Math.ceil(scaled.height));
-    const context = canvas.getContext('2d', { alpha: false });
+    const context = canvasContext(canvas);
     context.fillStyle = '#ffffff';
     context.fillRect(0, 0, canvas.width, canvas.height);
     await page.render({ canvasContext: context, viewport: scaled }).promise;
@@ -181,12 +196,12 @@
 
   async function renderPage(page, preset) {
     const viewport = page.getViewport({ scale: 1 });
-    const scale = Math.min(1.6, preset.maxEdge / Math.max(viewport.width, viewport.height, 1));
+    const scale = boundedScale(viewport, preset.maxEdge);
     const scaled = page.getViewport({ scale });
     const canvas = document.createElement('canvas');
     canvas.width = Math.max(1, Math.ceil(scaled.width));
     canvas.height = Math.max(1, Math.ceil(scaled.height));
-    const context = canvas.getContext('2d', { alpha: false });
+    const context = canvasContext(canvas);
     context.fillStyle = '#ffffff';
     context.fillRect(0, 0, canvas.width, canvas.height);
     await page.render({ canvasContext: context, viewport: scaled }).promise;
