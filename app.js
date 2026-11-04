@@ -6,19 +6,32 @@
   const fileName = $('file-name');
   const fileInfo = $('file-info');
   const convertButton = $('convert');
-  const downloadButton = $('download');
+  const shareButton = $('share-epub');
+  const directDownloadLink = $('direct-download');
+  const layoutQuality = $('layout-quality');
+  const layoutQualityWrap = $('layout-quality-wrap');
   const progressWrap = $('progress-wrap');
   const progressLabel = $('progress-label');
   const progressPct = $('progress-pct');
   const progressBar = $('progress-bar');
   const progressTrack = $('progress-track');
   const status = $('status');
-  const downloadLabel = $('download-label');
+  const shareLabel = $('share-label');
+
+  const layoutPresets = {
+    high: { maxEdge: 1500, quality: 0.78 },
+    balanced: { maxEdge: 1200, quality: 0.68 },
+    compact: { maxEdge: 950, quality: 0.58 }
+  };
+  const downloadUrlRetentionMs = 10 * 60 * 1000;
 
   let selectedFile = null;
   let epubBlob = null;
   let epubName = '阅读.epub';
+  let epubDownloadUrl = null;
   let busy = false;
+  let sharing = false;
+  let pendingDownloadNotice = null;
 
   if (globalThis.pdfjsLib) {
     pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('./vendor/pdf.worker.mjs', location.href).href;
@@ -33,9 +46,40 @@
     return document.querySelector('input[name="mode"]:checked')?.value || 'layout';
   }
 
+  function selectedLayoutPreset() {
+    return layoutPresets[layoutQuality.value] || layoutPresets.balanced;
+  }
+
   function setStatus(message, error = false) {
     status.textContent = message;
     status.classList.toggle('error', error);
+  }
+
+  function prepareDirectDownload() {
+    if (!epubBlob) throw new Error('EPUB 尚未生成。');
+    if (epubDownloadUrl) return;
+
+    const url = URL.createObjectURL(epubBlob);
+    epubDownloadUrl = url;
+    directDownloadLink.href = url;
+    directDownloadLink.download = epubName;
+    directDownloadLink.setAttribute('aria-disabled', 'false');
+    directDownloadLink.removeAttribute('tabindex');
+    window.setTimeout(() => {
+      URL.revokeObjectURL(url);
+      if (epubDownloadUrl !== url) return;
+      epubDownloadUrl = null;
+      if (epubBlob) {
+        try {
+          prepareDirectDownload();
+        } catch (error) {
+          directDownloadLink.removeAttribute('href');
+          directDownloadLink.setAttribute('aria-disabled', 'true');
+          directDownloadLink.setAttribute('tabindex', '-1');
+          setStatus(`下载链接已失效，无法重新创建：${error?.message || '未知错误'}`, true);
+        }
+      }
+    }, downloadUrlRetentionMs);
   }
 
   function setProgress(done, total, label) {
@@ -50,12 +94,20 @@
     convertButton.disabled = !selectedFile || busy;
     fileInput.disabled = busy;
     document.querySelectorAll('input[name="mode"]').forEach(input => { input.disabled = busy; });
+    layoutQuality.disabled = busy;
+    layoutQualityWrap.hidden = selectedMode() !== 'layout';
+    shareButton.disabled = !epubBlob || sharing;
   }
 
   function resetResult() {
     epubBlob = null;
-    downloadButton.disabled = true;
-    downloadLabel.textContent = '下载 EPUB';
+    epubDownloadUrl = null;
+    directDownloadLink.removeAttribute('href');
+    directDownloadLink.removeAttribute('download');
+    directDownloadLink.setAttribute('aria-disabled', 'true');
+    directDownloadLink.setAttribute('tabindex', '-1');
+    shareButton.disabled = true;
+    shareLabel.textContent = '分享并保存 EPUB · iPhone 选择“图书”';
     progressWrap.hidden = true;
     setStatus('');
   }
@@ -84,8 +136,13 @@
   });
 
   document.querySelectorAll('input[name="mode"]').forEach(input => {
-    input.addEventListener('change', resetResult);
+    input.addEventListener('change', () => {
+      resetResult();
+      refreshControls();
+    });
   });
+
+  layoutQuality.addEventListener('change', resetResult);
 
   function canvasToJpeg(canvas, quality) {
     return new Promise((resolve, reject) => {
@@ -122,9 +179,9 @@
     return { image: blob, width: viewport.width, height: viewport.height };
   }
 
-  async function renderPage(page) {
+  async function renderPage(page, preset) {
     const viewport = page.getViewport({ scale: 1 });
-    const scale = Math.min(1.6, 1500 / Math.max(viewport.width, viewport.height, 1));
+    const scale = Math.min(1.6, preset.maxEdge / Math.max(viewport.width, viewport.height, 1));
     const scaled = page.getViewport({ scale });
     const canvas = document.createElement('canvas');
     canvas.width = Math.max(1, Math.ceil(scaled.width));
@@ -133,7 +190,7 @@
     context.fillStyle = '#ffffff';
     context.fillRect(0, 0, canvas.width, canvas.height);
     await page.render({ canvasContext: context, viewport: scaled }).promise;
-    const blob = await canvasToJpeg(canvas, 0.78);
+    const blob = await canvasToJpeg(canvas, preset.quality);
     canvas.width = 1;
     canvas.height = 1;
     return { image: blob, width: viewport.width, height: viewport.height };
@@ -178,6 +235,7 @@
     let loadingTask = null;
     let pdf = null;
     const mode = selectedMode();
+    const layoutPreset = mode === 'layout' ? selectedLayoutPreset() : null;
     try {
       if (!globalThis.pdfjsLib || !globalThis.JSZip || !globalThis.PdfEpubCore) {
         throw new Error('本地转换组件未能加载。请通过静态网页地址打开，并确认 vendor 目录完整。');
@@ -209,7 +267,7 @@
       for (let pageNumber = 1; pageNumber <= total; pageNumber++) {
         const page = await pdf.getPage(pageNumber);
         if (mode === 'layout') {
-          const rendered = await renderPage(page);
+          const rendered = await renderPage(page, layoutPreset);
           if (pageNumber === 1) cover = rendered.image;
           pages.push({ ...rendered, imageType: 'image/jpeg' });
         } else {
@@ -244,14 +302,20 @@
         coverType: 'image/jpeg',
         outline
       }, JSZip);
+      const outputName = `${PdfEpubCore.safeFilename(title || selectedFile.name)}.epub`;
       epubBlob = blob;
-      epubName = `${PdfEpubCore.safeFilename(title || selectedFile.name)}.epub`;
-      downloadButton.disabled = false;
+      epubName = outputName;
+      prepareDirectDownload();
       setProgress(1, 1, '转换完成');
-      setStatus(`已生成 ${epubName} · ${formatSize(blob.size)}。`);
-      downloadLabel.textContent = '保存 EPUB · 在 iPhone 上分享至“图书”';
+      setStatus(`已生成 ${epubName} · ${formatSize(blob.size)}。可分享保存，也可直接下载。`);
     } catch (error) {
       console.error(error);
+      epubBlob = null;
+      epubDownloadUrl = null;
+      directDownloadLink.removeAttribute('href');
+      directDownloadLink.removeAttribute('download');
+      directDownloadLink.setAttribute('aria-disabled', 'true');
+      directDownloadLink.setAttribute('tabindex', '-1');
       const message = error?.name === 'PasswordException'
         ? '此 PDF 需要密码；当前版本无法处理加密文档。'
         : error?.name === 'InvalidPDFException'
@@ -270,30 +334,79 @@
     }
   }
 
-  async function saveEpub() {
-    if (!epubBlob) return;
-    const file = new File([epubBlob], epubName, { type: 'application/epub+zip' });
+  function shareFailureMessage(error) {
+    const name = error?.name || 'Error';
+    const detail = error?.message ? `：${error.message}` : '';
+    if (name === 'AbortError') return `系统分享已取消或未完成（${name}）；正在尝试下载`;
+    if (name === 'NotAllowedError') return `Safari 未能启动分享（${name}，可能受点击手势或系统权限限制）；正在尝试下载`;
+    if (name === 'DataError') return `系统无法传输此文件（${name}，大文件或分享目标可能受限）；正在尝试下载`;
+    return `分享失败（${name}${detail}）；正在尝试下载`;
+  }
+
+  function clickDirectDownload(notice, error = false) {
     try {
-      if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
-        await navigator.share({ files: [file], title: epubName });
+      prepareDirectDownload();
+      pendingDownloadNotice = { message: notice, error };
+      directDownloadLink.click();
+    } catch (downloadError) {
+      pendingDownloadNotice = null;
+      console.error(downloadError);
+      setStatus(`${notice}。Safari 未能启动下载：${downloadError?.message || '未知错误'}。请点“直接下载 EPUB”重试。`, true);
+    }
+  }
+
+  async function shareEpub() {
+    if (!epubBlob || sharing) return;
+    sharing = true;
+    shareLabel.textContent = '正在打开系统分享…';
+    setStatus(`正在分享 ${epubName}（${formatSize(epubBlob.size)}）…`);
+    refreshControls();
+
+    try {
+      const file = new File([epubBlob], epubName, { type: 'application/epub+zip' });
+      const files = [file];
+      const canShareFiles = typeof navigator.share === 'function'
+        && typeof navigator.canShare === 'function'
+        && navigator.canShare({ files });
+      if (!canShareFiles) {
+        clickDirectDownload('Safari 当前不支持此 EPUB 的文件分享（文件类型或大小可能受限），已改为下载请求', true);
         return;
       }
+
+      // Keep this call in the original click turn: yielding or awaiting before it can lose iOS transient activation.
+      await navigator.share({ files, title: epubName });
+      setStatus(`系统分享已完成：${epubName}。`);
     } catch (error) {
-      if (error?.name === 'AbortError') return;
-      setStatus('分享面板无法打开，正在改用浏览器下载。');
+      console.error('EPUB share failed; falling back to direct download.', error);
+      clickDirectDownload(`${shareFailureMessage(error)}，已发出下载请求；若 Safari 没有弹出下载提示，请点下方“直接下载 EPUB”重试`, true);
+    } finally {
+      sharing = false;
+      shareLabel.textContent = '分享并保存 EPUB · iPhone 选择“图书”';
+      refreshControls();
     }
-    const url = URL.createObjectURL(epubBlob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = epubName;
-    anchor.rel = 'noopener';
-    document.body.append(anchor);
-    anchor.click();
-    anchor.remove();
-    window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
   }
 
   convertButton.addEventListener('click', convert);
-  downloadButton.addEventListener('click', saveEpub);
+  shareButton.addEventListener('click', shareEpub);
+  directDownloadLink.addEventListener('click', event => {
+    if (!epubBlob) {
+      event.preventDefault();
+      return;
+    }
+    try {
+      prepareDirectDownload();
+    } catch (downloadError) {
+      event.preventDefault();
+      console.error(downloadError);
+      setStatus(`无法创建下载链接：${downloadError?.message || '未知错误'}`, true);
+      return;
+    }
+    const notice = pendingDownloadNotice || {
+      message: `已请求 Safari 下载 ${epubName}（${formatSize(epubBlob.size)}）。若打开预览，可从分享菜单存储到“文件”，再用“图书”打开。`,
+      error: false
+    };
+    pendingDownloadNotice = null;
+    setStatus(notice.message, notice.error);
+  });
   refreshControls();
 })();
