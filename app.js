@@ -23,7 +23,7 @@
     balanced: { maxEdge: 1200, quality: 0.68 },
     compact: { maxEdge: 950, quality: 0.58 }
   };
-  const maxCanvasPixels = 4_000_000;
+  const maxCanvasPixels = 16_000_000;
   const downloadUrlRetentionMs = 10 * 60 * 1000;
 
   let selectedFile = null;
@@ -49,6 +49,18 @@
 
   function selectedLayoutPreset() {
     return layoutPresets[layoutQuality.value] || layoutPresets.balanced;
+  }
+
+  function adaptiveRenderPreset(file, pageCount, preset) {
+    let factor = 1;
+    if (file.size >= 100 * 1024 * 1024 || pageCount >= 300) factor = 0.62;
+    else if (file.size >= 50 * 1024 * 1024 || pageCount >= 150) factor = 0.78;
+    else if (file.size >= 20 * 1024 * 1024 || pageCount >= 75) factor = 0.9;
+    return {
+      maxEdge: Math.max(650, Math.round(preset.maxEdge * factor)),
+      quality: Math.max(0.42, preset.quality * factor),
+      maxPixels: factor <= 0.62 ? 2_000_000 : factor <= 0.78 ? 3_000_000 : 6_000_000
+    };
   }
 
   function setStatus(message, error = false) {
@@ -163,11 +175,11 @@
     });
   }
 
-  function boundedScale(viewport, maxEdge) {
+  function boundedScale(viewport, maxEdge, pixelLimit = maxCanvasPixels) {
     const width = Math.max(1, viewport.width);
     const height = Math.max(1, viewport.height);
     const edgeScale = maxEdge / Math.max(width, height);
-    const areaScale = Math.sqrt(maxCanvasPixels / (width * height));
+    const areaScale = Math.sqrt(pixelLimit / (width * height));
     return Math.min(1.6, edgeScale, areaScale);
   }
 
@@ -177,38 +189,66 @@
     return context;
   }
 
-  async function renderCover(page) {
+  async function renderCover(page, preset = { maxEdge: 850, quality: 0.76, maxPixels: 2_000_000 }) {
     const viewport = page.getViewport({ scale: 1 });
-    const scale = Math.min(1.25, boundedScale(viewport, 850));
+    const scale = Math.min(1.25, boundedScale(viewport, preset.maxEdge, preset.maxPixels));
     const scaled = page.getViewport({ scale });
     const canvas = document.createElement('canvas');
-    canvas.width = Math.max(1, Math.ceil(scaled.width));
-    canvas.height = Math.max(1, Math.ceil(scaled.height));
-    const context = canvasContext(canvas);
-    context.fillStyle = '#ffffff';
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    await page.render({ canvasContext: context, viewport: scaled }).promise;
-    const blob = await canvasToJpeg(canvas, 0.76);
-    canvas.width = 1;
-    canvas.height = 1;
-    return { image: blob, width: viewport.width, height: viewport.height };
+    try {
+      canvas.width = Math.max(1, Math.ceil(scaled.width));
+      canvas.height = Math.max(1, Math.ceil(scaled.height));
+      const context = canvasContext(canvas);
+      context.fillStyle = '#ffffff';
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      await page.render({ canvasContext: context, viewport: scaled }).promise;
+      const blob = await canvasToJpeg(canvas, preset.quality);
+      return { image: blob, width: viewport.width, height: viewport.height };
+    } finally {
+      canvas.width = 0;
+      canvas.height = 0;
+    }
   }
 
   async function renderPage(page, preset) {
     const viewport = page.getViewport({ scale: 1 });
-    const scale = boundedScale(viewport, preset.maxEdge);
+    const scale = boundedScale(viewport, preset.maxEdge, preset.maxPixels);
     const scaled = page.getViewport({ scale });
     const canvas = document.createElement('canvas');
-    canvas.width = Math.max(1, Math.ceil(scaled.width));
-    canvas.height = Math.max(1, Math.ceil(scaled.height));
-    const context = canvasContext(canvas);
-    context.fillStyle = '#ffffff';
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    await page.render({ canvasContext: context, viewport: scaled }).promise;
-    const blob = await canvasToJpeg(canvas, preset.quality);
-    canvas.width = 1;
-    canvas.height = 1;
-    return { image: blob, width: viewport.width, height: viewport.height };
+    try {
+      canvas.width = Math.max(1, Math.ceil(scaled.width));
+      canvas.height = Math.max(1, Math.ceil(scaled.height));
+      const context = canvasContext(canvas);
+      context.fillStyle = '#ffffff';
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      await page.render({ canvasContext: context, viewport: scaled }).promise;
+      const blob = await canvasToJpeg(canvas, preset.quality);
+      return { image: blob, width: viewport.width, height: viewport.height };
+    } finally {
+      canvas.width = 0;
+      canvas.height = 0;
+    }
+  }
+
+  async function renderFailurePage(pageNumber, width, height) {
+    const aspect = Math.max(0.5, Math.min(2, width / Math.max(1, height)));
+    const canvas = document.createElement('canvas');
+    try {
+      canvas.width = Math.max(320, Math.min(900, Math.round(700 * aspect)));
+      canvas.height = Math.max(420, Math.min(1200, Math.round(canvas.width / aspect)));
+      const context = canvasContext(canvas);
+      context.fillStyle = '#fff';
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      context.fillStyle = '#333';
+      context.textAlign = 'center';
+      context.font = 'bold 28px sans-serif';
+      context.fillText(`第 ${pageNumber} 页渲染失败`, canvas.width / 2, canvas.height / 2 - 16);
+      context.font = '18px sans-serif';
+      context.fillText('已保留此页位置，请检查原始 PDF', canvas.width / 2, canvas.height / 2 + 24);
+      return await canvasToJpeg(canvas, 0.55);
+    } finally {
+      canvas.width = 0;
+      canvas.height = 0;
+    }
   }
 
   async function readOutline(pdf, nodes, depth = 0) {
@@ -249,6 +289,7 @@
 
     let loadingTask = null;
     let pdf = null;
+    let failedPages = 0;
     const mode = selectedMode();
     const layoutPreset = mode === 'layout' ? selectedLayoutPreset() : null;
     try {
@@ -275,30 +316,108 @@
       const pages = [];
       let cover = null;
       const total = pdf.numPages;
+      const renderPreset = mode === 'layout' ? adaptiveRenderPreset(selectedFile, total, layoutPreset) : null;
       setProgress(0, total, mode === 'layout' ? '正在逐页渲染' : '正在提取文字');
-      setStatus(`共 ${total} 页，正在本机处理…`);
+      setStatus(`共 ${total} 页，正在本机处理…${mode === 'layout' && renderPreset.maxEdge < layoutPreset.maxEdge ? ' 已按文件大小和页数降低图片清晰度以节省内存。' : ''}`);
       await yieldToBrowser();
 
       for (let pageNumber = 1; pageNumber <= total; pageNumber++) {
-        const page = await pdf.getPage(pageNumber);
-        if (mode === 'layout') {
-          const rendered = await renderPage(page, layoutPreset);
-          if (pageNumber === 1) cover = rendered.image;
-          pages.push({ ...rendered, imageType: 'image/jpeg' });
-        } else {
-          if (pageNumber === 1) {
-            const renderedCover = await renderCover(page);
-            cover = renderedCover.image;
-            pages.push({ coverDimensions: { width: renderedCover.width, height: renderedCover.height } });
+        let page;
+        try {
+          page = await pdf.getPage(pageNumber);
+        } catch (firstError) {
+          try {
+            page = await pdf.getPage(pageNumber);
+          } catch (retryError) {
+            failedPages++;
+            if (mode === 'layout') {
+              const image = await renderFailurePage(pageNumber, 800, 1100);
+              const missing = { image, imageType: 'image/jpeg', width: 800, height: 1100 };
+              pages.push(missing);
+              if (pageNumber === 1) cover = image;
+            } else {
+              const missing = { html: `<p>第 ${pageNumber} 页读取失败，已保留此页位置。</p>` };
+              if (pageNumber === 1) {
+                const image = await renderFailurePage(1, 800, 1100);
+                cover = image;
+                pages.push({ ...missing, coverDimensions: { width: 800, height: 1100 } });
+              } else pages.push(missing);
+            }
+            console.warn(`第 ${pageNumber} 页读取失败，已添加提示页。`, firstError, retryError);
+            setProgress(pageNumber, total, `第 ${pageNumber} 页已降级 · ${pageNumber} / ${total}`);
+            await yieldToBrowser();
+            continue;
           }
-          const content = await page.getTextContent({ includeMarkedContent: false, disableNormalization: false });
-          const pageText = PdfEpubCore.textItemsToHtml(content.items);
-          if (pageNumber === 1) pages[pages.length - 1].html = pageText;
-          else pages.push({ html: pageText });
         }
-        page.cleanup();
+        try {
+          if (mode === 'layout') {
+            let rendered;
+            try {
+              rendered = await renderPage(page, renderPreset);
+            } catch (firstError) {
+              setStatus(`第 ${pageNumber} 页渲染失败，正在降低分辨率重试…`, true);
+              try { page.cleanup(); } catch (_) { /* 清理失败不影响重试 */ }
+              const retryPreset = {
+                maxEdge: Math.max(480, Math.floor(renderPreset.maxEdge * 0.65)),
+                quality: Math.max(0.38, renderPreset.quality * 0.78),
+                maxPixels: Math.min(renderPreset.maxPixels, 1_200_000)
+              };
+              try {
+                rendered = await renderPage(page, retryPreset);
+              } catch (retryError) {
+                failedPages++;
+                const view = page.getViewport({ scale: 1 });
+                rendered = {
+                  image: await renderFailurePage(pageNumber, view.width, view.height),
+                  width: view.width,
+                  height: view.height
+                };
+                console.warn(`第 ${pageNumber} 页渲染失败，已写入提示页。`, firstError, retryError);
+              }
+            }
+            if (pageNumber === 1) cover = rendered.image;
+            pages.push({ ...rendered, imageType: 'image/jpeg' });
+          } else {
+            if (pageNumber === 1) {
+              let renderedCover;
+              try {
+                renderedCover = await renderCover(page);
+              } catch (firstError) {
+                try {
+                  renderedCover = await renderCover(page, { maxEdge: 480, quality: 0.45, maxPixels: 600_000 });
+                } catch (retryError) {
+                  const view = page.getViewport({ scale: 1 });
+                  renderedCover = { image: await renderFailurePage(1, view.width, view.height), width: view.width, height: view.height };
+                  failedPages++;
+                  console.warn('封面渲染失败，已生成提示封面。', firstError, retryError);
+                }
+              }
+              cover = renderedCover.image;
+              pages.push({ coverDimensions: { width: renderedCover.width, height: renderedCover.height } });
+            }
+            let pageHtml;
+            try {
+              const content = await page.getTextContent({ includeMarkedContent: false, disableNormalization: false });
+              pageHtml = PdfEpubCore.textItemsToHtml(content.items);
+            } catch (firstError) {
+              try {
+                page.cleanup();
+                const content = await page.getTextContent({ includeMarkedContent: false, disableNormalization: false });
+                pageHtml = PdfEpubCore.textItemsToHtml(content.items);
+              } catch (retryError) {
+                failedPages++;
+                pageHtml = `<p>第 ${pageNumber} 页文字提取失败，已保留此页位置。</p>`;
+                console.warn(`第 ${pageNumber} 页文字提取失败。`, firstError, retryError);
+              }
+            }
+            if (pageNumber === 1) pages[pages.length - 1].html = pageHtml;
+            else pages.push({ html: pageHtml });
+          }
+        } finally {
+          page.cleanup();
+        }
         setProgress(pageNumber, total, mode === 'layout' ? `正在渲染第 ${pageNumber} / ${total} 页` : `正在提取第 ${pageNumber} / ${total} 页`);
-        if (pageNumber % 2 === 0 || pageNumber === total) await yieldToBrowser();
+        if (pageNumber % 1 === 0) await yieldToBrowser();
       }
 
       await loadingTask.destroy();
@@ -307,6 +426,7 @@
       setProgress(0, 1, '正在打包 EPUB');
       setStatus('页面已处理，正在生成电子书…');
       await yieldToBrowser();
+      setStatus('页面已处理，正在分块生成电子书…');
       const blob = await PdfEpubCore.createEpub({
         title,
         author,
@@ -315,14 +435,22 @@
         cover,
         coverDimensions: mode === 'text' ? pages[0]?.coverDimensions : pages[0],
         coverType: 'image/jpeg',
-        outline
+        outline,
+        streamFiles: selectedFile.size >= 20 * 1024 * 1024 || total >= 20,
+        onZipProgress: metadata => {
+          const percent = Math.max(0, Math.min(100, Math.round(metadata.percent || 0)));
+          progressBar.style.width = `${percent}%`;
+          progressPct.textContent = `${percent}%`;
+          progressTrack.setAttribute('aria-valuenow', String(percent));
+          progressLabel.textContent = `正在打包 EPUB · ${percent}%`;
+        }
       }, JSZip);
       const outputName = `${PdfEpubCore.safeFilename(title || selectedFile.name)}.epub`;
       epubBlob = blob;
       epubName = outputName;
       prepareDirectDownload();
       setProgress(1, 1, '转换完成');
-      setStatus(`已生成 ${epubName} · ${formatSize(blob.size)}。可分享保存，也可直接下载。`);
+      setStatus(`已生成 ${epubName} · ${formatSize(blob.size)}。${failedPages ? `${failedPages} 页已降级保留提示页。` : ''}可分享保存，也可直接下载。`, failedPages > 0);
     } catch (error) {
       console.error(error);
       epubBlob = null;

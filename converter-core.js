@@ -124,6 +124,7 @@
     const coverExtension = coverType === 'image/png' ? 'png' : 'jpg';
     const fixedLayout = mode === 'layout';
     const coverDimensions = options.coverDimensions || pages[0];
+    const streamFiles = options.streamFiles === true || pageCount >= 20;
     const add = (path, data, extra = {}) => zip.file(path, data, { createFolders: false, ...extra });
 
     if (fixedLayout) {
@@ -184,10 +185,42 @@
     const layoutValue = fixedLayout ? 'pre-paginated' : 'reflowable';
     const opf = `<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="book-id" xml:lang="${escapeXml(lang)}" prefix="rendition: http://www.idpf.org/vocab/rendition/#"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="book-id">${escapeXml(bookId)}</dc:identifier><dc:title>${escapeXml(title)}</dc:title><dc:creator>${escapeXml(author)}</dc:creator><dc:language>${escapeXml(lang)}</dc:language><meta property="dcterms:modified">${date}</meta><meta property="rendition:layout">${layoutValue}</meta><meta property="rendition:spread">none</meta></metadata><manifest>${manifest.join('')}</manifest><spine toc="ncx">${spine.join('')}</spine></package>`;
     add('OEBPS/content.opf', xmlFile('opf', opf));
-    return zip.generateAsync({
-      type: typeof window !== 'undefined' ? 'blob' : 'nodebuffer',
+    const stream = zip.generateInternalStream({
+      type: 'uint8array',
       mimeType: EPUB_MIMETYPE,
-      compression: 'STORE'
+      compression: 'STORE',
+      streamFiles
+    });
+    const chunks = [];
+    let totalBytes = 0;
+    return new Promise((resolve, reject) => {
+      stream.on('data', chunk => {
+        chunks.push(chunk);
+        totalBytes += chunk.byteLength;
+      });
+      stream.on('error', reject);
+      stream.on('end', () => {
+        try {
+          if (typeof window !== 'undefined') {
+            resolve(new Blob(chunks, { type: EPUB_MIMETYPE }));
+          } else {
+            const output = Buffer.allocUnsafe(totalBytes);
+            let offset = 0;
+            for (const chunk of chunks) {
+              output.set(chunk, offset);
+              offset += chunk.byteLength;
+            }
+            resolve(output);
+          }
+        } catch (error) {
+          reject(error);
+        }
+      });
+      if (typeof options.onZipProgress === 'function') {
+        stream.on('data', (chunk, metadata) => options.onZipProgress(metadata || { percent: stream.percent || 0 }));
+        stream.on('end', () => options.onZipProgress({ percent: 100 }));
+      }
+      stream.resume();
     });
   }
 
