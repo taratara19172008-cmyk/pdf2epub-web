@@ -99,6 +99,14 @@
     return `<?xml version="1.0" encoding="UTF-8"?>\n${body}`;
   }
 
+  function imageByteLength(image) {
+    if (image == null) return 0;
+    if (typeof image.size === 'number') return image.size;
+    if (typeof image.byteLength === 'number') return image.byteLength;
+    if (typeof image.length === 'number') return image.length;
+    return -1;
+  }
+
   async function createEpub(options, JSZip) {
     if (typeof JSZip !== 'function') throw new Error('JSZip 未加载');
     const { pages, mode } = options || {};
@@ -117,6 +125,14 @@
     const fixedLayout = mode === 'layout';
     const coverDimensions = options.coverDimensions || pages[0];
     const add = (path, data, extra = {}) => zip.file(path, data, { createFolders: false, ...extra });
+
+    if (fixedLayout) {
+      for (let index = 0; index < pageCount; index++) {
+        if (imageByteLength(pages[index].image) <= 0) {
+          throw new Error(`第 ${index + 1} 页图片为空或缺失`);
+        }
+      }
+    }
 
     // EPUB 要求该文件是 ZIP 中第一个成员，并且保持 STORE（不压缩）。
     add('mimetype', EPUB_MIMETYPE, { compression: 'STORE' });
@@ -146,6 +162,7 @@
           : `../images/${id}.${imageExtension}`;
         if (!(index === 0 && pages[index].image === coverImage)) {
           add(`OEBPS/images/${id}.${imageExtension}`, pages[index].image, { binary: true });
+          manifest.push(`<item id="image-${id}" href="images/${id}.${imageExtension}" media-type="${imageExtension === 'png' ? 'image/png' : 'image/jpeg'}"/>`);
         }
         body = `<section class="page"><span id="page-${pageNumber}" class="pagebreak" epub:type="pagebreak" role="doc-pagebreak" aria-label="${pageNumber}"/><figure><img class="page-image" src="${imagePath}" alt="第 ${pageNumber} 页"/></figure></section>`;
       } else {
