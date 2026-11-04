@@ -423,6 +423,10 @@
       await loadingTask.destroy();
       loadingTask = null;
       pdf = null;
+      if (mode === 'text') {
+        const cleanedPages = PdfEpubCore.removeRepeatedPageArtifacts(pages);
+        for (let index = 0; index < pages.length; index++) pages[index] = cleanedPages[index];
+      }
       setProgress(0, 1, '正在打包 EPUB');
       setStatus('页面已处理，正在生成电子书…');
       await yieldToBrowser();

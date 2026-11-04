@@ -22,14 +22,18 @@
   function textItemsToHtml(items) {
     const lines = [];
     let line = '';
-    let previousY = null;
-    let previousXEnd = null;
-    let previousFont = 12;
+    let lineX = null;
+    let lineEnd = null;
+    let lineY = null;
+    let lineFont = 12;
+    let previousItemY = null;
+    let previousItemXEnd = null;
     const flush = () => {
-      const content = line.replace(/[\t ]+/g, ' ').trim();
-      if (content) lines.push(content);
+      const text = line.replace(/[\t ]+/g, ' ').trim();
+      if (text) lines.push({ text, x: lineX, end: lineEnd, y: lineY, font: lineFont });
       line = '';
-      previousXEnd = null;
+      lineX = lineEnd = lineY = null;
+      previousItemXEnd = null;
     };
 
     for (const item of items || []) {
@@ -42,18 +46,84 @@
       const transform = item.transform || [];
       const x = Number(transform[4]);
       const y = Number(transform[5]);
-      const font = Math.max(1, Math.hypot(Number(transform[2]) || 0, Number(transform[3]) || 0) || previousFont);
-      if (line && Number.isFinite(y) && Number.isFinite(previousY) && Math.abs(y - previousY) > Math.max(2, font * 0.5)) flush();
-      if (line && Number.isFinite(x) && Number.isFinite(previousXEnd) && x - previousXEnd > Math.max(1.5, font * 0.18) && !/^\s/.test(item.str)) line += ' ';
+      const font = Math.max(1, Math.hypot(Number(transform[2]) || 0, Number(transform[3]) || 0) || lineFont || 12);
+      if (line && Number.isFinite(y) && Number.isFinite(previousItemY) && Math.abs(y - previousItemY) > Math.max(2, font * 0.5)) flush();
+      if (line && Number.isFinite(x) && Number.isFinite(previousItemXEnd) && x - previousItemXEnd > Math.max(1.5, font * 0.18) && !/^\s/.test(item.str)) line += ' ';
+      if (!line) {
+        lineX = Number.isFinite(x) ? x : null;
+        lineY = Number.isFinite(y) ? y : null;
+      }
       line += value;
-      previousY = y;
-      previousXEnd = Number.isFinite(x) ? x + Math.max(value.length * font * 0.48, Number(item.width) || 0) : null;
-      previousFont = font;
+      lineFont = font;
+      previousItemY = y;
+      previousItemXEnd = Number.isFinite(x) ? x + Math.max(value.length * font * 0.48, Number(item.width) || 0) : null;
+      lineEnd = previousItemXEnd;
       if (item.hasEOL) flush();
     }
     flush();
     if (!lines.length) return '<p class="empty">（本页没有可提取的文字）</p>';
-    return lines.map(text => `<p>${escapeXml(text)}</p>`).join('\n');
+
+    const sortedYs = lines.slice(1).map((current, index) => {
+      const previous = lines[index];
+      return Number.isFinite(current.y) && Number.isFinite(previous.y) ? Math.abs(previous.y - current.y) : null;
+    }).filter(gap => gap != null && gap > 0);
+    const baselineGap = sortedYs.length ? sortedYs.sort((a, b) => a - b)[Math.floor(sortedYs.length / 2)] : null;
+    const rightEdge = lines.reduce((edge, current) => Math.max(edge, current.end || 0), 0);
+    const paragraphs = [];
+    let paragraph = lines[0].text;
+    const hasCjk = text => /[\u3400-\u9fff]/.test(text);
+    const join = (left, right) => {
+      if (/-$/.test(left) && /[A-Za-z]/.test(left)) return left.slice(0, -1) + right;
+      return hasCjk(left) || hasCjk(right) ? left + right : `${left} ${right}`;
+    };
+    const completeEnding = text => /[。！？!?；;：:]$/.test(text);
+    const titleLike = lineInfo => lineInfo.text.length <= 18 && !/[，。！？；：、,.;:!?]$/.test(lineInfo.text);
+    for (let index = 1; index < lines.length; index++) {
+      const previous = lines[index - 1];
+      const current = lines[index];
+      const gap = Number.isFinite(previous.y) && Number.isFinite(current.y) ? Math.abs(previous.y - current.y) : null;
+      const font = Math.max(previous.font || 12, current.font || 12);
+      const largeGap = gap != null && (gap > font * 1.65 || (baselineGap && gap > baselineGap * 1.55));
+      const indentShift = previous.x != null && current.x != null && Math.abs(current.x - previous.x) > font * 1.35;
+      const previousLineShort = previous.end != null && rightEdge - previous.end > font * 2.2;
+      const startsIndented = indentShift && current.x > previous.x;
+      const breakParagraph = largeGap || titleLike(current) && (largeGap || startsIndented) ||
+        (startsIndented && (completeEnding(previous.text) || previousLineShort && completeEnding(previous.text)));
+      if (breakParagraph) {
+        paragraphs.push(paragraph);
+        paragraph = current.text;
+      } else {
+        paragraph = join(paragraph, current.text);
+      }
+    }
+    paragraphs.push(paragraph);
+    return paragraphs.map(text => `<p>${escapeXml(text)}</p>`).join('\n');
+  }
+
+  function removeRepeatedPageArtifacts(pages) {
+    if (!Array.isArray(pages) || pages.length < 2) return pages;
+    const pageParagraphs = pages.map(page => String(page?.html || '').match(/<p(?:\s[^>]*)?>[\s\S]*?<\/p>/g) || []);
+    const occurrences = new Map();
+    pageParagraphs.forEach(paragraphs => {
+      const candidates = [...paragraphs.slice(0, 3), ...paragraphs.slice(-3)];
+      for (const paragraph of new Set(candidates)) {
+        const text = paragraph.replace(/^<p(?:\s[^>]*)?>|<\/p>$/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/\s+/g, ' ').trim();
+        if (text.length >= 2) occurrences.set(text, (occurrences.get(text) || 0) + 1);
+      }
+    });
+    const repeated = new Set([...occurrences].filter(([, count]) => count >= 2 && count / pages.length >= 0.3).map(([text]) => text));
+    return pages.map((page, pageIndex) => {
+      if (!page?.html) return page;
+      const paragraphs = pageParagraphs[pageIndex];
+      const kept = paragraphs.filter((paragraph, index) => {
+        const text = paragraph.replace(/^<p(?:\s[^>]*)?>|<\/p>$/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/\s+/g, ' ').trim();
+        const pageNumber = /^(?:第\s*)?\d{1,5}\s*(?:页|面)?$/.test(text);
+        const atEdge = index < 3 || index >= paragraphs.length - 3;
+        return !pageNumber && !(atEdge && repeated.has(text));
+      });
+      const html = kept.length ? kept.join('\n') : '<p class="empty">（本页没有可提取的文字）</p>';
+      return { ...page, html };
+    });
   }
 
   function xhtml(title, body, lang, nested = false, dimensions = null, fixedLayout = false) {
@@ -232,5 +302,5 @@
     return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
   }
 
-  return { EPUB_MIMETYPE, createEpub, escapeXml, safeFilename, textItemsToHtml };
+  return { EPUB_MIMETYPE, createEpub, escapeXml, removeRepeatedPageArtifacts, safeFilename, textItemsToHtml };
 });

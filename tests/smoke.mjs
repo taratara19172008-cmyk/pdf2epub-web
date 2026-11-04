@@ -117,6 +117,23 @@ assert.match(Core.textItemsToHtml([
   { str: 'EPUB & Books', width: 70, transform: [12, 0, 0, 12, 10, 80], hasEOL: true }
 ]), /EPUB &amp; Books/);
 
+const reflowHtml = Core.textItemsToHtml([
+  { str: '这是一个完整段落，', width: 108, transform: [12, 0, 0, 12, 20, 100], hasEOL: true },
+  { str: '后续物理行继续这里。', width: 120, transform: [12, 0, 0, 12, 20, 88], hasEOL: true },
+  { str: '标题保持独立', width: 78, transform: [12, 0, 0, 12, 20, 55], hasEOL: true },
+  { str: 'English hyphen-', width: 90, transform: [12, 0, 0, 12, 20, 30], hasEOL: true },
+  { str: 'ated word.', width: 60, transform: [12, 0, 0, 12, 20, 18], hasEOL: true }
+]);
+assert.match(reflowHtml, /<p>这是一个完整段落，后续物理行继续这里。<\/p>/, 'adjacent Chinese physical lines are joined without a space');
+assert.match(reflowHtml, /<p>标题保持独立<\/p>/, 'a short line after a paragraph gap remains a separate paragraph');
+assert.match(reflowHtml, /<p>English hyphenated word\.<\/p>/, 'English line ending hyphens are removed when joining');
+const cleanedPages = Core.removeRepeatedPageArtifacts([
+  { html: '<p>重复书眉</p><p>正文甲</p><p>95</p>' },
+  { html: '<p>重复书眉</p><p>正文乙</p><p>96</p>' },
+  { html: '<p>重复书眉</p><p>正文丙</p><p>97</p>' }
+]);
+assert.ok(cleanedPages.every(page => !page.html.includes('重复书眉') && !/<p>\d+<\/p>/.test(page.html)), 'repeated headers and standalone page numbers are removed');
+
 const pdfTask = pdfjsLib.getDocument({ data: makePdf(), isEvalSupported: false, verbosity: pdfjsLib.VerbosityLevel.ERRORS });
 let extractedHtml;
 try {
